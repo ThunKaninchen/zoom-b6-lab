@@ -20,6 +20,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.rememberScrollState
@@ -30,11 +33,14 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -73,21 +79,26 @@ fun ChooserScreen(
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val loader = rememberSvgLoader()
     val groups = remember(catalog) { catalog.byGroup() }
-    val currentFx = replaceSlot?.let { slot -> ui.pedals.firstOrNull { it.slot == slot }?.fx }
+    val currentView = replaceSlot?.let { slot -> ui.pedals.firstOrNull { it.slot == slot } }
+    val currentFx = currentView?.fx
     // opens on the group of the effect being changed, else the first group
-    var tab by rememberSaveable(replaceSlot, expected.slot) { mutableIntStateOf(catalog.groupIndexOf(currentFx?.fxId)) }
-    val tabIndex = tab.coerceIn(0, (groups.size - 1).coerceAtLeast(0))
-    val current = groups.getOrNull(tabIndex)?.second.orEmpty()
-    // ui is read so that the greying follows a patch change while the chooser is open
-    val fitting = remember(ui, current, replaceSlot) { current.map { controller.fits(it.fxId, replaceSlot) } }
-    val title = if (replaceSlot == null) "Add effect" else "Change ${currentFx?.name ?: "effect"}"
-    val removeLabel = "Remove ${currentFx?.name ?: "effect"}"
+    // swiping pages the grids; the tab row follows pagerState.currentPage
+    val pagerState = rememberPagerState(initialPage = catalog.clampGroup(catalog.groupIndexOf(currentFx?.fxId))) { groups.size }
+    val scope = rememberCoroutineScope()
+    val title = if (replaceSlot == null) "Add effect" else "Change ${currentView?.name ?: "effect"}"
+    val removeLabel = "Remove ${currentView?.name ?: "effect"}"
     val remove = { controller.remove(replaceSlot!!, expected); onClose() }
 
     Box(modifier.fillMaxSize().background(B6Colors.Gunmetal)) {
         // blocks touches to the board: a sibling behind the content, so it only gets what the content leaves alone
         Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTapGestures { } })
-        ChooserContent(landscape, groups, tabIndex, { tab = it }, title, removeLabel, replaceSlot != null, remove, onClose, current, fitting, currentFx?.fxId, loader) { fx ->
+        ChooserContent(landscape, groups, pagerState, { scope.launch { pagerState.animateScrollToPage(it) } }, title, removeLabel, replaceSlot != null, remove, onClose,
+            { page ->
+                // ui is read so that the greying follows a patch change while the chooser is open
+                val effects = groups[page].second
+                val fitting = remember(ui, effects, replaceSlot) { effects.map { controller.fits(it.fxId, replaceSlot) } }
+                effects to fitting
+            }, currentFx?.fxId, loader) { fx ->
             controller.choose(fx.fxId, replaceSlot, expected); onClose()
         }
     }
@@ -97,24 +108,44 @@ fun ChooserScreen(
 private fun ChooserContent(
     landscape: Boolean,
     groups: List<Pair<String, List<nl.b6lab.remote.core.EffectInfo>>>,
-    tabIndex: Int,
+    pagerState: PagerState,
     onTab: (Int) -> Unit,
     title: String,
     removeLabel: String,
     canRemove: Boolean,
     remove: () -> Unit,
     onClose: () -> Unit,
-    current: List<nl.b6lab.remote.core.EffectInfo>,
-    fitting: List<Boolean>,
+    pageEffects: @Composable (Int) -> Pair<List<nl.b6lab.remote.core.EffectInfo>, List<Boolean>>,
     currentFxId: Int?,
     loader: coil.ImageLoader,
     onPick: (nl.b6lab.remote.core.EffectInfo) -> Unit,
 ) {
+    // highlight the page being scrolled to (no walk through intermediate tabs on a far tap);
+    // scroll the tabs into view only once a page has settled
+    val tabIndex = pagerState.targetPage
+    val settled = pagerState.settledPage
+    val pages: @Composable (GridCells, Int) -> Unit = { cells, height ->
+        HorizontalPager(pagerState, Modifier.fillMaxSize()) { page ->
+            val (effects, fitting) = pageEffects(page)
+            EffectGrid(cells, height, effects, fitting, currentFxId, loader, onPick)
+        }
+    }
     Box(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp)) {
         if (landscape) {
             Row(Modifier.fillMaxSize()) {
-                Column(Modifier.width(120.dp).fillMaxHeight().verticalScroll(rememberScrollState())) {
-                    groups.forEachIndexed { i, (name, _) -> GroupTab(sentenceCase(name), i == tabIndex, true) { onTab(i) } }
+                val railScroll = rememberScrollState()
+                val tabY = remember { mutableStateMapOf<Int, Pair<Int, Int>>() }
+                // keep the selected tab in view as pages change
+                LaunchedEffect(settled, tabY[settled], railScroll.viewportSize) {
+                    val (y, h) = tabY[settled] ?: return@LaunchedEffect
+                    railScroll.animateScrollTo((y + h / 2 - railScroll.viewportSize / 2).coerceIn(0, railScroll.maxValue))
+                }
+                Column(Modifier.width(120.dp).fillMaxHeight().verticalScroll(railScroll)) {
+                    groups.forEachIndexed { i, (name, _) ->
+                        Box(Modifier.fillMaxWidth().onGloballyPositioned { tabY[i] = it.positionInParent().y.toInt() to it.size.height }) {
+                            GroupTab(sentenceCase(name), i == tabIndex, true) { onTab(i) }
+                        }
+                    }
                 }
                 Spacer(Modifier.width(8.dp))
                 Column(Modifier.weight(1f)) {
@@ -123,7 +154,7 @@ private fun ChooserContent(
                         Text(title, style = B6Text.Title, fontSize = 24.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                         if (canRemove) RemoveButton(removeLabel, remove)
                     }
-                    EffectGrid(GridCells.Adaptive(96.dp), 88, current, fitting, currentFxId, loader, onPick)
+                    pages(GridCells.Adaptive(96.dp), 88)
                 }
             }
         } else {
@@ -132,11 +163,22 @@ private fun ChooserContent(
                     Text(title, style = B6Text.Title, fontSize = 28.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                     CloseButton(onClose)
                 }
-                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
-                    groups.forEachIndexed { i, (name, _) -> GroupTab(sentenceCase(name), i == tabIndex, false) { onTab(i) } }
+                val rowScroll = rememberScrollState()
+                val tabX = remember { mutableStateMapOf<Int, Pair<Int, Int>>() }
+                // keep the selected tab in view as pages change
+                LaunchedEffect(settled, tabX[settled], rowScroll.viewportSize) {
+                    val (x, w) = tabX[settled] ?: return@LaunchedEffect
+                    rowScroll.animateScrollTo((x + w / 2 - rowScroll.viewportSize / 2).coerceIn(0, rowScroll.maxValue))
+                }
+                Row(Modifier.fillMaxWidth().horizontalScroll(rowScroll)) {
+                    groups.forEachIndexed { i, (name, _) ->
+                        Box(Modifier.onGloballyPositioned { tabX[i] = it.positionInParent().x.toInt() to it.size.width }) {
+                            GroupTab(sentenceCase(name), i == tabIndex, false) { onTab(i) }
+                        }
+                    }
                 }
                 Box(Modifier.weight(1f)) {
-                    EffectGrid(GridCells.Fixed(3), 96, current, fitting, currentFxId, loader, onPick)
+                    pages(GridCells.Fixed(3), 96)
                 }
                 if (canRemove) Row(Modifier.fillMaxWidth()) { RemoveButton(removeLabel, remove) }
             }

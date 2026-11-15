@@ -8,7 +8,7 @@ Three free tools for the Zoom B6 bass multi-effects pedal, made because Zoom's o
 | App | Runs on | What it is for | How to get it |
 |---|---|---|---|
 | **B6 Lab** | Linux desktop | Full editor: all 240 patches, effects, knobs, names, patch search, import/export, backups | Run from this repository (see below) |
-| **B6 Remote** | Android phone | Live editing of the active patch from a phone on a mic stand, for practice and on stage | Download the APK from the [Releases page](https://github.com/SchitzelKraft/zoom-b6-lab/releases) |
+| **B6 Remote** | Android phone | Live editing of the active patch from a phone on a mic stand, for practice and on stage | Download the APK from the [Releases page](https://github.com/ThunKaninchen/zoom-b6-lab/releases) |
 | **B6 MCP server** | Linux, with an AI assistant (Claude Code, Codex or any MCP client) | Ask an assistant to look up, draw, build, audition, tune, rename and search patches, with safety rules built in | Run from this repository (see [B6 MCP server](#b6-mcp-server-ai-assistant-tools)) |
 
 All three talk to the pedal over a USB cable; no Zoom drivers are needed. They share the same
@@ -45,6 +45,8 @@ Only one program can hold the pedal's MIDI port at a time; close other editors a
 
 B6 Remote is a separate Android app (an APK you install on the phone). It edits the active patch of a Zoom B6 live over a USB cable (OTG), for practice and on stage. It shows a pedal board with the effect pictures, on/off footswitches and knobs; you can add, change, remove and move effects and save the patch. It follows patch changes you make on the pedal, and works in portrait and landscape. The search button next to the patch arrows finds a patch by number (Z-104 or 104), name or effect name; tap a result and the pedal switches to it.
 
+Colours and type come from `design/tokens/tokens.json`. After changing it, run `.venv/bin/python tools/tokens.py` and commit the generated files too.
+
 <p>
   <img src="docs/android/portrait.png" alt="B6 Remote in portrait" width="230">
   <img src="docs/android/landscape.png" alt="B6 Remote in landscape" width="520">
@@ -55,7 +57,7 @@ B6 Remote is a separate Android app (an APK you install on the phone). It edits 
 
 ### Download and install
 
-Download `B6Remote-1.3.apk` from the [Releases page](https://github.com/SchitzelKraft/zoom-b6-lab/releases). On your phone, allow installing apps from this source when Android asks, then open the APK and install it.
+Download `B6Remote-1.4.apk` from the [Releases page](https://github.com/ThunKaninchen/zoom-b6-lab/releases). On your phone, allow installing apps from this source when Android asks, then open the APK and install it.
 
 ### Requirements
 

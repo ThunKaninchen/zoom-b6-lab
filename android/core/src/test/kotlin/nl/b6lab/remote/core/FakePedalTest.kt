@@ -240,4 +240,35 @@ class FakePedalTest {
             // expected
         }
     }
+
+    @Test
+    fun knobLagAppliesLateAndSkipsEchoes() {
+        val p = FakePedal(List(8) { image(it) }, knobLag = 4)
+        p.sx(Msg.ENTER_PC)
+        p.incoming.drain()
+        assertTrue(Ptcf.parse(p.editBuffer()).effects[0].params[1] !in 30..32)
+        p.sx(Msg.setParam(0, 1, 30))
+        // the first knob set is echoed (the pedal was idle), the next ones are skipped while it is busy
+        fun knobEchoes() = p.incoming.drain().count { body(it)[6].toInt() == 0 }
+        assertEquals(1, knobEchoes())
+        p.sx(Msg.setParam(0, 1, 31))
+        p.sx(Msg.setParam(0, 1, 32))
+        assertEquals(0, knobEchoes())
+        // 30 applied after two more sets (4 messages); 31 and 32 are still queued
+        assertEquals(30, Ptcf.parse(p.editBuffer()).effects[0].params[1])
+        assertEquals(2, p.lateKnobs)
+        // a read still shows 30, then the queue applies
+        assertEquals(30, editPatch(p).effects[0].params[1])
+        assertEquals(0, p.lateKnobs)
+        assertEquals(32, editPatch(p).effects[0].params[1])
+    }
+
+    @Test
+    fun pinnedKnobKeepsItsValue() {
+        val p = pedal()
+        val old = Ptcf.parse(p.editBuffer()).effects[0].params[1]
+        p.pinKnob(0, 1)
+        p.sx(Msg.setParam(0, 1, old + 1))
+        assertEquals(old, editPatch(p).effects[0].params[1])
+    }
 }

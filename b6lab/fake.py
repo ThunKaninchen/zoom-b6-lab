@@ -2,7 +2,7 @@
 import struct
 
 from b6lab import ptcf
-from b6lab.midi import SLOT_SIZE
+from b6lab.midi import SLOT_SIZE, bank_name_bytes
 
 
 class FakeB6:
@@ -32,11 +32,17 @@ class FakeB6:
         self.presses = []          # positions of press_effect calls, for tests
         self.params_sent = []      # (position, module, index, value) of set_param calls
         self.closed = False
+        self.released = 0          # release() calls, for tests
+        self.bank_names = [""] * 60
         # global data reply (64 09) as the B6 sends it: tempo 120, calibration 440 Hz, AUTO SAVE
         # off (byte 12)
         self.global_reply = bytes.fromhex("52 00 6e 64 09 78 00 00 01 05 00 00 00 00 00 00 00")
         self.auto_save = False     # like the pedal's AUTO SAVE: live edits are stored at once
         self.wide = set()          # fx IDs the fake treats as double width (tests fill it)
+        # like the real pedal (B6.change_type): a type change gives the effect the knob values
+        # that type last had on the pedal. Off by default: knob values are kept.
+        self.remember_values = False
+        self.remembered = {}       # fx_id -> knob values, filled when an effect is left
 
     def _check_timeout(self):
         if self.timeout_next:
@@ -46,6 +52,16 @@ class FakeB6:
     def identity(self):
         self._check_timeout()
         return bytes([0x7E, 0x00, 0x06, 0x02, 0x52, 0x6E, 0x00, 0x00, 0x00, 0x31, 0x2E, 0x30, 0x30])
+
+    def read_bank_names(self):
+        self._check_timeout()
+        return list(self.bank_names)
+
+    def write_bank_names(self, names):
+        self._check_timeout()
+        if len(names) != 60:
+            raise ValueError("Bank names: 60 names needed")
+        self.bank_names = [bank_name_bytes(n).decode("ascii").rstrip(" ") for n in names]
 
     def patch_info(self):
         self._check_timeout()
@@ -155,6 +171,8 @@ class FakeB6:
         self._check_timeout()
         self.type_changes.append((position, fx_id))
         p = ptcf.parse(self.edit)
+        if self.remember_values and position < len(p.effects):
+            self._remember(p.effects[position])
         has_tail = position + 1 < len(p.effects) and p.effects[position + 1].is_tail
         if fx_id in self.wide and not has_tail:
             # the pedal decides: a double-width type needs a second entry (modelled: added
@@ -167,8 +185,15 @@ class FakeB6:
             del p.effect_ids[position + 1]
             ptcf._renumber(p)
         ptcf.set_type(p, position, fx_id)
+        if self.remember_values and fx_id in self.remembered:
+            for i, v in enumerate(self.remembered[fx_id]):
+                ptcf.set_param(p, position, i, v)
         self.edit = ptcf.encode(p).ljust(SLOT_SIZE, b"\0")
         self._auto_store()
+
+    def _remember(self, effect):
+        if effect.fx_id and not effect.is_tail:
+            self.remembered[effect.fx_id] = list(effect.params)
 
     # effects on the pedal: FLST_SEQ.ZT2 and the module / icon files (b6lab/ffs.py)
     def read_effect_list(self):
@@ -240,6 +265,8 @@ class FakeB6:
         self._check_timeout()
         self.chain_edits.append(("delete", position))
         p = ptcf.parse(self.edit)
+        if self.remember_values and position < len(p.effects):
+            self._remember(p.effects[position])
         if ptcf.delete_entry(p, position):
             self.edit = ptcf.encode(p).ljust(SLOT_SIZE, b"\0")
 
@@ -253,6 +280,10 @@ class FakeB6:
             ptcf.set_on(p, e.slot, not e.on)
             self.edit = ptcf.encode(p).ljust(SLOT_SIZE, b"\0")
             self._auto_store()
+
+    def release(self):
+        """The release sequence for a stuck pedal (B6.release); only counted."""
+        self.released += 1
 
     def close(self):
         self.closed = True

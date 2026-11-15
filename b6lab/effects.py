@@ -6,7 +6,11 @@ IR name list (`64 1A`), by tools/build_effects.py, into pedal-files/effects.json
 ZD2 layout (see zoom-zt2's zoomzt2.ZD2): "ZDLF", ..., version @0x58, group byte @0x5F,
 effect ID u32 LE @0x60, name (NUL-terminated, max 11) @0x64, group name @0x6F, then
 chunks ... PRMJ (Japanese) and PRME (English) parameter JSON:
-{"Parameters": [{"name", "explanation", "blackback", "pedal"}, ...]} in knob order.
+{"Parameters": [{"name", "explanation", "blackback", "pedal"}, ...]} in display order.
+That is the pedal's parameter order except for Kick FLNG (ON/OFF listed fourth, parameter 6):
+`parse_zd2` puts the knobs in the order of the DSP code's effect descriptor (zd2_tables).
+
+Knobs whose display is a table entry get `display_labels` from the DSP code (b6lab.zd2_tables).
 
 IR effects (ID high byte 0x1B) have no ZD2 file: ID low byte - 0x10 = index into
 the pedal's IR name list. High byte 0x1A is the SND-RTN group (FxLoop, Send, Return), also
@@ -20,6 +24,8 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+
+from b6lab import zd2_tables
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "pedal-files" / "effects.json"
 RANGES_PATH = DEFAULT_PATH.with_name("parameter-ranges.json")
@@ -85,9 +91,26 @@ def parse_zd2(data):
     prme = _chunk(data, b"PRME")
     if prme:
         doc = json.loads(prme.decode("utf-8", "replace").rstrip("\0 \r\n"))
-        info.params = [ParamInfo(p.get("name", ""), p.get("explanation", ""), bool(p.get("pedal")))
-                       for p in doc.get("Parameters", [])]
+        params = [ParamInfo(p.get("name", ""), p.get("explanation", ""), bool(p.get("pedal")))
+                  for p in doc.get("Parameters", [])]
+        order = parameter_order([p.name for p in params], zd2_tables.knob_names(data) or [])
+        info.params = params if order is None else [params[i] for i in order]
     return info
+
+
+def parameter_order(prme_names, descriptor_names):
+    """PRME index of each pedal parameter, when the effect descriptor's knob names (trailing
+    Dummy/hidden records left out) are the PRME names in another order; else None.
+
+    PRME gives the display order, the descriptor the parameter index (captured ranges and the
+    pedal's 64 06 / knob messages follow it). Repeated names keep their relative order."""
+    head = list(descriptor_names[:len(prme_names)])
+    if head == list(prme_names) or sorted(head) != sorted(prme_names):
+        return None
+    free = {}
+    for i, name in enumerate(prme_names):
+        free.setdefault(name, []).append(i)
+    return [free[name].pop(0) for name in head]
 
 
 def parse_ir_names(msg):
@@ -172,7 +195,13 @@ def with_builtin(cat):
 def build(zd2_files, ir_names=()):
     cat = {}
     for f in zd2_files:
-        info = parse_zd2(Path(f).read_bytes())
+        data = Path(f).read_bytes()
+        info = parse_zd2(data)
+        # knobs whose pedal display is a table entry (MID-F frequencies, ...): see zd2_tables
+        for param, table in zip(info.params, zd2_tables.knob_labels(
+                data, [p.name for p in info.params])):
+            if table is not None:
+                param.display_labels = table
         cat[info.fx_id] = info
     for i, _ in enumerate(ir_names):
         fx_id = IR_CATEGORIES[0] << 24 | (i + IR_BASE)
@@ -216,6 +245,9 @@ def _load_parameter_ranges(cat, path):
             for param, limit in zip(info.params, record['parameters']):
                 param.raw_max = int(limit['maximum'])
                 display = limit.get('display')
+                if param.display_labels is not None and (
+                        display or len(param.display_labels) != param.raw_max + 1):
+                    param.display_labels = None  # a table only for knobs without a scale
                 if display:
                     param.display_min = display['minimum']
                     param.display_step = display['step']

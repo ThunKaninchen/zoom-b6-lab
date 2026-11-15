@@ -1,7 +1,7 @@
 """Which real-world gear each B6 effect imitates (data in data/effect_models.json).
 
-`docs/zoom/B6-EFFECT-MODELS.md` is generated from that file by
-`tools/gen_effect_models_doc.py`; edit the JSON, not the doc.
+The JSON is the source. A human-readable overview can be generated locally with
+`tools/gen_effect_models_doc.py` (not part of the published repository).
 """
 import json
 from pathlib import Path

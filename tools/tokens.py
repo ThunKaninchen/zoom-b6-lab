@@ -1,0 +1,337 @@
+"""B6 design tokens: loader, validator, WCAG contrast check, Kotlin and QML emitters, CLI.
+
+Standard library only. Format contract: design/tokens/TOKEN-SCHEMA.md (v0.4).
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+VERSION = "0.4"
+TOP_LEVEL = {"$schemaNote", "version", "color", "categoryColor", "typography", "space", "radius",
+             "size", "notes", "categoryNote", "contrastNote", "contrast"}
+MINIMUM = {"normal": 4.5, "large": 3.0, "mark": 3.0}
+CSS_NAMES = {"goldenrod": "#DAA520"}
+_HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_PAIR_FIELDS = {"foreground", "background", "kind", "underlay"}
+
+
+class TokenError(ValueError):
+    pass
+
+
+def load(path: Path) -> dict:
+    tokens = json.loads(Path(path).read_text())
+    if tokens.get("version") != VERSION:
+        raise TokenError(f"unsupported version: {tokens.get('version')!r} (need {VERSION!r})")
+    for key in tokens:
+        if key in TOP_LEVEL:
+            continue
+        raise TokenError(f"unknown key: {key}")
+    return tokens
+
+
+def _lookup(tokens: dict, name: str):
+    if name.startswith("categoryColor."):
+        group, key = tokens.get("categoryColor", {}), name[len("categoryColor."):]
+    else:
+        group, key = tokens.get("color", {}), name[len("color."):] if name.startswith("color.") else name
+    if key not in group:
+        raise TokenError(f"unknown colour: {name}")
+    return group[key]
+
+
+def _hex_rgb(value: str, name: str) -> tuple:
+    if not isinstance(value, str) or not _HEX.match(value):
+        raise TokenError(f"invalid colour value for {name}: {value!r}")
+    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def resolve_color(tokens: dict, name: str, _chain: tuple = ()) -> tuple:
+    if name in _chain:
+        raise TokenError("reference cycle: " + " -> ".join(_chain[_chain.index(name):] + (name,)))
+    value = _lookup(tokens, name)
+    if name.startswith("categoryColor.") and not (isinstance(value, str) and _HEX.match(value)):
+        raise TokenError(f"{name}: category colour must be an opaque #RRGGBB string, got {value!r}")
+    if isinstance(value, str):
+        return (*_hex_rgb(value, name), 1.0)
+    if not isinstance(value, dict):
+        raise TokenError(f"invalid colour value for {name}: {value!r}")
+    fields = set(value)
+    if fields == {"hex", "css"}:
+        rgb = _hex_rgb(value["hex"], name)
+        expected = CSS_NAMES.get(value["css"])
+        if expected is None or _hex_rgb(expected, name) != rgb:
+            raise TokenError(f"{name}: css name {value['css']!r} does not match {value['hex']}")
+        return (*rgb, 1.0)
+    if fields == {"ref", "alpha"}:
+        alpha = value["alpha"]
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0 <= alpha <= 1:
+            raise TokenError(f"{name}: alpha must be 0..1, got {alpha!r}")
+        r, g, b, a = resolve_color(tokens, value["ref"], _chain + (name,))
+        return (r, g, b, a * alpha)
+    raise TokenError(f"{name}: unknown field(s) in colour value: {sorted(fields)}")
+
+
+def composite(fg: tuple, bg: tuple) -> tuple:
+    a = fg[3] if len(fg) > 3 else 1.0
+    return tuple(fg[i] * a + bg[i] * (1 - a) for i in range(3))
+
+
+def _luminance(rgb) -> float:
+    def lin(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(c) for c in rgb[:3])
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(a_rgb, b_rgb) -> float:
+    hi, lo = sorted((_luminance(a_rgb), _luminance(b_rgb)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def check_contrast(tokens: dict) -> list:
+    failures = []
+    for item in tokens.get("contrast", []):
+        extra = set(item) - _PAIR_FIELDS
+        if extra:
+            raise TokenError(f"contrast pair: unknown field(s) {sorted(extra)}")
+        fg_name, bg_name = item.get("foreground"), item.get("background")
+        if not fg_name or not bg_name:
+            raise TokenError(f"contrast pair needs foreground and background: {item}")
+        kind = item.get("kind")
+        if kind not in MINIMUM:
+            raise TokenError(f"{fg_name} on {bg_name}: unknown kind {kind!r}")
+        fg = resolve_color(tokens, fg_name)
+        bg = resolve_color(tokens, bg_name)
+        if bg[3] < 1:
+            if "underlay" not in item:
+                raise TokenError(f"{fg_name} on {bg_name}: translucent background needs an underlay")
+            under = resolve_color(tokens, item["underlay"])
+            if under[3] < 1:
+                raise TokenError(f"{fg_name} on {bg_name}: underlay {item['underlay']} must be opaque")
+            bg_rgb = composite(bg, under)
+        else:
+            bg_rgb = bg[:3]
+        ratio = contrast_ratio(composite(fg, bg_rgb), bg_rgb)
+        if ratio < MINIMUM[kind]:
+            failures.append(f"{fg_name} on {bg_name}: {ratio:.2f} < {MINIMUM[kind]}")
+    return failures
+
+
+HEADER = "// Generated by tools/tokens.py from design/tokens/tokens.json. Do not edit."
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE = ROOT / "design/tokens/tokens.json"
+KOTLIN_PATH = "android/app/src/main/kotlin/nl/b6lab/remote/ui/Tokens.kt"
+QML_PATH = "b6lab/qml/Theme/Tokens.qml"
+QMLDIR_PATH = "b6lab/qml/Theme/qmldir"
+QMLDIR = "singleton Tokens 1.0 Tokens.qml\n"
+WEIGHTS = {400: "Normal", 500: "Medium", 600: "DemiBold"}
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+
+
+def validate(tokens: dict) -> list:
+    """Return every problem found (empty list when the tokens are valid)."""
+    problems = []
+
+    def attempt(fn, *args):
+        try:
+            return fn(*args)
+        except TokenError as e:
+            problems.append(str(e))
+        except (KeyError, TypeError, AttributeError) as e:
+            problems.append(f"malformed tokens: {e!r}")
+
+    for key in tokens.get("color", {}):
+        attempt(resolve_color, tokens, key)
+    for key in tokens.get("categoryColor", {}):
+        attempt(resolve_color, tokens, "categoryColor." + key)
+
+    typo = tokens.get("typography", {})
+    families = typo.get("families", {})
+    for name, role in typo.get("roles", {}).items():
+        if not isinstance(role, dict):
+            problems.append(f"typography.{name}: role must be an object")
+            continue
+        if role.get("family") not in families:
+            problems.append(f"typography.{name}: unknown family {role.get('family')!r}")
+        for field in ("size", "lineHeight"):
+            v = role.get(field)
+            if not _num(v) or v == 0:
+                problems.append(f"typography.{name}: {field} must be a positive number, got {v!r}")
+        if role.get("weight") not in WEIGHTS or isinstance(role.get("weight"), bool):
+            problems.append(f"typography.{name}: weight must be one of 400/500/600, got {role.get('weight')!r}")
+        feats = role.get("features", [])
+        if not isinstance(feats, list) or not all(isinstance(f, str) for f in feats):
+            problems.append(f"typography.{name}: features must be a list of strings")
+
+    for group in ("space", "radius"):
+        for k, v in tokens.get(group, {}).items():
+            if not _num(v):
+                problems.append(f"{group}.{k}: must be a nonnegative number, got {v!r}")
+    for k, v in tokens.get("size", {}).items():
+        if isinstance(v, dict):
+            for k2, v2 in v.items():
+                if not _num(v2):
+                    problems.append(f"size.{k}.{k2}: must be a nonnegative number, got {v2!r}")
+        elif not _num(v):
+            problems.append(f"size.{k}: must be a nonnegative number, got {v!r}")
+
+    contrast = tokens.get("contrast", [])
+    if not isinstance(contrast, list) or not all(isinstance(i, dict) for i in contrast):
+        problems.append("contrast must be a list of objects")
+    else:
+        for item in contrast:
+            failures = attempt(check_contrast, {**tokens, "contrast": [item]})
+            problems.extend(failures or [])
+    seen = set()
+    return [p for p in problems if not (p in seen or seen.add(p))]
+
+
+def _upper(key: str) -> str:
+    return key[:1].upper() + key[1:]
+
+
+def _kt_color(rgba) -> str:
+    r, g, b, a = rgba
+    return f"Color(0x{round(a * 255):02X}{r:02X}{g:02X}{b:02X})"
+
+
+def _qml_color(rgba) -> str:
+    r, g, b, a = rgba
+    if a >= 1:
+        return f'"#{r:02x}{g:02x}{b:02x}"'
+    return f'"#{round(a * 255):02x}{r:02x}{g:02x}{b:02x}"'
+
+
+def _fmt(v) -> str:
+    return str(int(v)) if float(v) == int(v) else str(v)
+
+
+def emit_kotlin(tokens: dict) -> str:
+    L = [HEADER, "package nl.b6lab.remote.ui", "",
+         "import androidx.compose.ui.graphics.Color",
+         "import androidx.compose.ui.text.font.FontWeight",
+         "import androidx.compose.ui.unit.TextUnit",
+         "import androidx.compose.ui.unit.dp",
+         "import androidx.compose.ui.unit.sp", "",
+         "object B6Tokens {",
+         "    data class Role(",
+         "        val family: String,",
+         "        val size: TextUnit,",
+         "        val weight: FontWeight,",
+         "        val lineHeight: TextUnit,",
+         "        val tnum: Boolean,",
+         "    )", "",
+         "    object Colors {"]
+    for k in tokens.get("color", {}):
+        L.append(f"        val {_upper(k)} = {_kt_color(resolve_color(tokens, k))}")
+    L += ["    }", "", "    object Category {"]
+    for k in tokens.get("categoryColor", {}):
+        L.append(f"        val {_upper(k)} = {_kt_color(resolve_color(tokens, 'categoryColor.' + k))}")
+    L += ["    }", ""]
+    for group, title in (("space", "Space"), ("radius", "Radius")):
+        L.append(f"    object {title} {{")
+        for k, v in tokens.get(group, {}).items():
+            name = "S" + k if group == "space" else _upper(k)
+            L.append(f"        val {name} = {_fmt(v)}.dp")
+        L += ["    }", ""]
+    L.append("    object Size {")
+    for k, v in tokens.get("size", {}).items():
+        if isinstance(v, dict):
+            L.append(f"        object {_upper(k)} {{")
+            for k2, v2 in v.items():
+                L.append(f"            val {_upper(k2)} = {_fmt(v2)}.dp")
+            L.append("        }")
+        else:
+            L.append(f"        val {_upper(k)} = {_fmt(v)}.dp")
+    L += ["    }", "", "    object Type {"]
+    for k, r in tokens.get("typography", {}).get("roles", {}).items():
+        tnum = "true" if "tnum" in r.get("features", []) else "false"
+        L.append(f'        val {_upper(k)} = Role("{r["family"]}", {_fmt(r["size"])}.sp, '
+                 f'FontWeight.W{r["weight"]}, {_fmt(r["lineHeight"])}.sp, {tnum})')
+    L += ["    }", "}", ""]
+    return "\n".join(L)
+
+
+def emit_qml(tokens: dict) -> str:
+    L = [HEADER.replace("//", "//", 1), "pragma Singleton", "import QtQuick", "", "QtObject {"]
+    for k in tokens.get("color", {}):
+        L.append(f"    readonly property color {k}: {_qml_color(resolve_color(tokens, k))}")
+    for k in tokens.get("categoryColor", {}):
+        L.append(f"    readonly property color category{_upper(k)}: "
+                 f"{_qml_color(resolve_color(tokens, 'categoryColor.' + k))}")
+    for k, v in tokens.get("space", {}).items():
+        L.append(f"    readonly property int space{k}: {_fmt(v)}")
+    for k, v in tokens.get("radius", {}).items():
+        L.append(f"    readonly property int radius{_upper(k)}: {_fmt(v)}")
+    for k, v in tokens.get("size", {}).items():
+        if isinstance(v, dict):
+            for k2, v2 in v.items():
+                L.append(f"    readonly property int size{_upper(k)}{_upper(k2)}: {_fmt(v2)}")
+        else:
+            L.append(f"    readonly property int size{_upper(k)}: {_fmt(v)}")
+    families = tokens.get("typography", {}).get("families", {})
+    for k, r in tokens.get("typography", {}).get("roles", {}).items():
+        tnum = "true" if "tnum" in r.get("features", []) else "false"
+        L += [f"    readonly property QtObject type{_upper(k)}: QtObject {{",
+              f'        readonly property string family: "{families[r["family"]]}"',
+              f"        readonly property int pixelSize: {_fmt(r['size'])}",
+              f"        readonly property int weight: Font.{WEIGHTS[r['weight']]}",
+              f"        readonly property int lineHeight: {_fmt(r['lineHeight'])}",
+              f"        readonly property bool tnum: {tnum}",
+              "    }"]
+    L += ["}", ""]
+    return "\n".join(L)
+
+
+def render_all(tokens: dict) -> dict:
+    return {KOTLIN_PATH: emit_kotlin(tokens), QML_PATH: emit_qml(tokens), QMLDIR_PATH: QMLDIR}
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Generate B6 Remote and B6 Lab themes from design tokens.")
+    ap.add_argument("--check", action="store_true", help="exit 1 if generated files are out of date")
+    ap.add_argument("--out-root", type=Path, default=ROOT)
+    args = ap.parse_args(argv)
+    try:
+        tokens = load(SOURCE)
+        problems = validate(tokens)
+    except (TokenError, OSError, ValueError) as e:
+        problems = [str(e)]
+    if problems:
+        for p in problems:
+            print(p, file=sys.stderr)
+        return 1
+    outputs = render_all(tokens)
+    if args.check:
+        stale = [rel for rel, text in outputs.items()
+                 if not (args.out_root / rel).exists() or (args.out_root / rel).read_text() != text]
+        for rel in stale:
+            print(f"out of date: {rel}", file=sys.stderr)
+        return 1 if stale else 0
+    temps = []
+    try:
+        for rel, text in outputs.items():
+            target = args.out_root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp")
+            tmp.write_text(text)
+            temps.append((tmp, target))
+        for tmp, target in temps:
+            os.replace(tmp, target)
+    finally:
+        for tmp, _ in temps:
+            if tmp.exists():
+                tmp.unlink()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

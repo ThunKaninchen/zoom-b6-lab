@@ -17,6 +17,12 @@ ENABLE_UI_DELAY = 0.3
 ENABLE_UI_SENDS = 2
 
 
+def bank_name_bytes(name):
+    """One bank name as 10 bytes: ASCII only (anything else becomes a space), space padded."""
+    text = "".join(c if 32 <= ord(c) < 127 else " " for c in str(name))[:10]
+    return text.ljust(10).encode("ascii")
+
+
 class DeviceBusy(Exception):
     """The MIDI device is open in another program."""
 
@@ -164,6 +170,22 @@ class B6:
                 if msg[4] != 0:
                     raise RuntimeError(f"pedal returned error 0x{msg[4]:02X}")
                 return msg
+
+    def read_bank_names(self):
+        """The 60 bank names: 64 18 <first:2> <last:2> -> 64 19 01 <first:2> <last:2> 0A <10 chars each>."""
+        msg = self.request([*HDR, 0x64, 0x18, 0x00, 0x00, 0x3B, 0x00], [*HDR, 0x64, 0x19])
+        if len(msg) < 11 + 600 or msg[10] != 0x0A:
+            raise ValueError("Bank names: truncated or invalid reply")
+        body = bytes(msg[11:11 + 600])
+        return [body[i * 10:(i + 1) * 10].decode("ascii", "replace").rstrip(" \x00")
+                for i in range(60)]
+
+    def write_bank_names(self, names):
+        """Set the 60 bank names (10 ASCII characters each, space padded)."""
+        if len(names) != 60:
+            raise ValueError("Bank names: 60 names needed")
+        body = b"".join(bank_name_bytes(n) for n in names)
+        self.request_ack([*HDR, 0x64, 0x19, 0x01, 0x00, 0x00, 0x3B, 0x00, 0x0A, *body])
 
     def identity(self):
         return self.request([0x7E, 0x7F, 0x06, 0x01], [0x7E])
@@ -361,6 +383,17 @@ class B6:
                 self.request_ack([*HDR, 0x51])
             return
         self.send([*HDR, 0x64, 0x0B if on else 0x0C])
+
+    def release(self):
+        """Release a stuck pedal (spec 7 V4, from Bass Lab): close any open file
+        (`60 21 40 00 00 00 00`; a stuck open file blocks MIDI, verified), then `51` (end PC
+        mode), `64 13`, `00 00`, 0.25 s apart. Nothing is read: the caller connects again to
+        see whether the pedal answers."""
+        msgs = ([0x60, 0x21, 0x40, 0x00, 0x00, 0x00, 0x00], [0x51], [0x64, 0x13], [0x00, 0x00])
+        for i, msg in enumerate(msgs):
+            if i:
+                time.sleep(0.25)
+            self.send([*HDR, *msg])
 
     def set_auto_save(self, on):
         """AUTO SAVE (global parameter 0x0F) as Guitar Lab's setter FUN_1002a7ff0 sends it, the

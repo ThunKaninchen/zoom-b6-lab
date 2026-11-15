@@ -16,7 +16,10 @@ data class SearchHit(
     val fxIds: List<Int>,
     val rank: Int,
     val reason: String?,
-)
+) {
+    /** Effect IDs worth a thumbnail: an empty block (fx 0) has no picture. */
+    val thumbnailIds: List<Int> get() = fxIds.filter { it != 0 }
+}
 
 /**
  * The patches the session has read so far, and the search over them (spec .superpowers/search/spec.md).

@@ -546,6 +546,9 @@ class SessionTest {
             Msg.setParam(2, 0, 21).map { it.toList() },
             sentBodies(p).drop(n).map { it.toList() },
         )
+        // the knob is confirmed first (a chain edit right after an unconfirmed knob confirms it before it starts)
+        advanceTimeBy(1000)
+        runCurrent()
         n = p.sent.size
         s.changeType(s.ref, 4, 0x5890011)
         assertEquals(0x5890011, s.state.value.edit!!.effects[4].fxId)

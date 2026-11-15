@@ -199,9 +199,9 @@ def fixtures():
 
 
 def _svg_name(fx_id):
-    """Guitar Lab SVG module name, as b6lab/gui/editor.py:_module (IR: _IR, SND-RTN: FX_LOOP/SEND/RETURN)."""
+    """Guitar Lab SVG module name, as b6lab/gui/editor.py:_module (IR: IR, not _IR which reads AMP; SND-RTN: FX_LOOP/SEND/RETURN)."""
     if fx_id >> 24 in effects.IR_CATEGORIES:
-        return "_IR"
+        return "IR"
     if fx_id >> 24 == effects.SND_RTN_CATEGORY:
         return {0x20: "FX_LOOP", 0x23: "SEND", 0x26: "RETURN"}.get(fx_id & 0xFF)
     ranges = json.loads(effects.RANGES_PATH.read_text())

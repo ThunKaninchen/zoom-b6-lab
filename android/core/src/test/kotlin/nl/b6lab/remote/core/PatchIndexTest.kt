@@ -116,4 +116,10 @@ class PatchIndexTest {
             assertEquals(index.search(a, catalog), index.search(b, catalog))
         }
     }
+
+    @Test
+    fun thumbnailsLeaveOutEmptyBlocks() {
+        val hit = SearchHit(0, "A-1", "x", listOf(5, 0, 7, 0), 2, null)
+        assertEquals(listOf(5, 7), hit.thumbnailIds)
+    }
 }

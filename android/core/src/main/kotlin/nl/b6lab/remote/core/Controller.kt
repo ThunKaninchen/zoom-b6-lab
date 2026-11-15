@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /** One pedal of the board. [slot] is the chain entry index (what the session operations take). */
-data class PedalView(val slot: Int, val fx: EffectInfo?, val on: Boolean, val selected: Boolean)
+data class PedalView(val slot: Int, val fx: EffectInfo?, val on: Boolean, val selected: Boolean, val name: String = fx?.name ?: "?", val fxId: Int = fx?.fxId ?: 0)
 
 data class KnobView(val index: Int, val name: String, val value: Int, val max: Int, val text: String)
 
@@ -242,7 +242,7 @@ class RemoteController(
         val connected = s.connection == Connection.CONNECTED
         val effects = edit?.effects.orEmpty()
         val pedals = effects.filter { !it.isTail }
-            .map { PedalView(it.slot, catalog.effects[it.fxId], it.on, it.slot == selected) }
+            .map { PedalView(it.slot, catalog.effects[it.fxId], it.on, it.slot == selected, catalog.nameOf(it.fxId), it.fxId) }
         val ref = s.ref
         if (ref != freeRef) {
             freeRef = ref

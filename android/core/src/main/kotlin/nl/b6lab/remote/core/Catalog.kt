@@ -52,6 +52,9 @@ data class EffectInfo(
 )
 
 class Catalog(val effects: Map<Int, EffectInfo>) {
+    /** What a chain entry is called: "Bypass" for id 0 (an empty block, not an installable effect), "?" if unknown. */
+    fun nameOf(fxId: Int): String = if (fxId == 0) "Bypass" else effects[fxId]?.name ?: "?"
+
     /** Groups in Guitar Lab order (`ptcf.CATEGORIES` by category byte); effects by id inside a group. */
     fun byGroup(): List<Pair<String, List<EffectInfo>>> {
         val byName = effects.values.groupBy { it.group }
@@ -62,6 +65,9 @@ class Catalog(val effects: Map<Int, EffectInfo>) {
     /** Index in [byGroup] of the group holding [fxId]; 0 when it is null or unknown. */
     fun groupIndexOf(fxId: Int?): Int =
         if (fxId == null) 0 else byGroup().indexOfFirst { (_, l) -> l.any { it.fxId == fxId } }.coerceAtLeast(0)
+
+    /** [index] limited to a valid tab of [byGroup] (0 when there are no groups). */
+    fun clampGroup(index: Int): Int = index.coerceIn(0, (byGroup().size - 1).coerceAtLeast(0))
 
     private fun load(fxId: Int) = effects[fxId]?.dspLoad ?: 0.0
 

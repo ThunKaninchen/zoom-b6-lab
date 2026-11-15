@@ -63,6 +63,9 @@ class B6Session(
         const val STORE_TIMEOUT_MS = 10_000L
         const val POLL_MS = 750L
         const val PARAM_DEBOUNCE_MS = 150L
+        /** A knob the pedal does not show at the value sent is sent again this often, this long apart. */
+        const val KNOB_RETRIES = 3
+        const val KNOB_RETRY_WAIT_MS = 50L
         /** b6lab/midi.py waits: after each press/release pair, after a chain edit, after a store. */
         const val PRESS_WAIT_MS = 50L
         const val EDIT_WAIT_MS = 250L
@@ -132,6 +135,12 @@ class B6Session(
     @Volatile private var pushedSlot: Int? = null
     private val paramPushes = Channel<Unit>(Channel.CONFLATED)
 
+    /** A knob value this app sent to the effect [fxId]; it stays shown until the pedal confirms it ([settleKnobs]). */
+    private data class SentKnob(val fxId: Int, val value: Int)
+
+    /** Knob values sent and not yet confirmed, by (effect entry, knob index): the last value sent for each. */
+    @Volatile private var sentKnobs: Map<Pair<Int, Int>, SentKnob> = emptyMap()
+
     // ---- public operations ------------------------------------------------------------------
 
     /** Identity, PC mode (or polling when busy), AUTO SAVE, selected slot, edit buffer, stored slot. */
@@ -185,6 +194,8 @@ class B6Session(
 
     /** Bank select + program change, then the new patch is read. Unsaved changes are dropped. */
     suspend fun selectSlot(slot: Int) = op {
+        // knob values still queued on the pedal must land in the patch being left, not in the new one
+        if (sentKnobs.isNotEmpty()) settleKnobs()
         // in PC mode the pedal follows our own selection, whether or not it announces it with a push (without PC mode
         // there are no pushes: the poller reads the slot)
         if (_state.value.pcMode) pushedSlot = slot
@@ -198,7 +209,8 @@ class B6Session(
     /**
      * Knob [index] of effect entry [slot] (b6lab/live.py send_param). No edit-buffer read per step: in PC mode the
      * pushes keep [state] current, so [expected] is checked against it (without PC mode one read per call). The
-     * new value is shown at once; one confirming read follows [PARAM_DEBOUNCE_MS] after the last step.
+     * new value is shown at once and stays shown over reads ([sentKnobs]) until [settleKnobs] confirms it,
+     * [PARAM_DEBOUNCE_MS] after the last step.
      */
     suspend fun setKnob(expected: PatchRef, slot: Int, index: Int, value: Int) = op {
         checkRef(expected)
@@ -206,7 +218,8 @@ class B6Session(
         val pos = positionOf(now, slot)
         if (!now.effects[slot].editable(index)) throw Refused("knob ${index + 1} of effect entry $slot is not editable")
         sendAll(Msg.setParam(pos, index, value))
-        setEdit(Ptcf.parse(Ptcf.encode(Ptcf.setParam(now, slot, index, value)).copyOf(SLOT_SIZE)))
+        sentKnobs = sentKnobs + ((slot to index) to SentKnob(now.effects[slot].fxId, value))
+        setEdit(now)
         paramPushes.trySend(Unit)
     }
 
@@ -230,6 +243,7 @@ class B6Session(
      */
     suspend fun add(expected: PatchRef, pos: Int, fxId: Int) = op {
         checkRef(expected)
+        if (sentKnobs.isNotEmpty()) settleKnobs() // confirm the knobs first: entries may move, the store must hold them
         val before = checkedEdit(expected)
         if (pos !in 0..before.effects.size) throw Refused("no place $pos")
         send(Msg.insertEffect(pos))
@@ -264,6 +278,7 @@ class B6Session(
      */
     suspend fun save(expected: PatchRef) = op {
         checkRef(expected)
+        if (sentKnobs.isNotEmpty()) settleKnobs() // confirm the knobs first: entries may move, the store must hold them
         val slot = expected.slot
         if (selectedSlot() != slot) throw Refused(PATCH_CHANGED)
         val before = checkedEdit(expected)
@@ -324,6 +339,7 @@ class B6Session(
         action: suspend (Patch) -> Unit,
     ) = op {
         checkRef(expected)
+        if (sentKnobs.isNotEmpty()) settleKnobs() // confirm the knobs first: entries may move, the store must hold them
         val before = checkedEdit(expected)
         action(before)
         val after = readEdit()
@@ -422,7 +438,7 @@ class B6Session(
                 paramPushes.receive()
                 // debounce: wait until the knob pushes pause for PARAM_DEBOUNCE_MS
                 while (withTimeoutOrNull(PARAM_DEBOUNCE_MS) { paramPushes.receive() } != null) Unit
-                background { setEdit(readEdit()) }
+                background { settleKnobs() }
             }
         }
         if (!_state.value.pcMode) {
@@ -438,13 +454,18 @@ class B6Session(
     /** Without PC mode: `33` and an edit-buffer read; the stored slot is read again when the slot changed. */
     private suspend fun poll() {
         val slot = selectedSlot()
-        val edit = readEdit()
-        if (slot != _state.value.slot) stored = readStored(slot).also { indexSlot(slot, it) }
+        val read = readEdit()
+        if (slot != _state.value.slot) {
+            sentKnobs = emptyMap()
+            stored = readStored(slot).also { indexSlot(slot, it) }
+        }
+        val edit = withSentKnobs(read)
         _state.update { it.copy(slot = slot, edit = edit, dirty = isDirty(edit)) }
     }
 
     /** Slot [slot] is selected: read its edit buffer and its stored image. */
     private suspend fun load(slot: Int) {
+        sentKnobs = emptyMap() // another patch, or the same one reloaded: unconfirmed knob values are dropped
         val edit = readEdit()
         stored = readStored(slot).also { indexSlot(slot, it) }
         _state.update { it.copy(slot = slot, edit = edit, dirty = isDirty(edit)) }
@@ -503,7 +524,76 @@ class B6Session(
         _indexStatus.value = if (_index.value.indexed >= PatchIndex.SLOTS) IndexStatus.DONE else IndexStatus.STOPPED
     }
 
-    private fun setEdit(p: Patch) = _state.update { it.copy(edit = p, dirty = isDirty(p)) }
+    /** Shows [p] (a read, a dump, or a local change) with the knob values sent and not yet confirmed. */
+    private fun setEdit(p: Patch) {
+        val shown = withSentKnobs(p)
+        _state.update { it.copy(edit = shown, dirty = isDirty(shown)) }
+    }
+
+    /** [p] with every knob value of [sentKnobs] that still fits it (same effect at that entry, editable knob). */
+    private fun withSentKnobs(p: Patch): Patch {
+        val sent = sentKnobs
+        if (sent.isEmpty()) return p
+        var out = p
+        for ((k, s) in sent) {
+            val (slot, index) = k
+            if (fits(out, slot, index, s) && out.effects[slot].params[index] != s.value) {
+                out = Ptcf.parse(Ptcf.encode(Ptcf.setParam(out, slot, index, s.value)).copyOf(SLOT_SIZE))
+            }
+        }
+        return out
+    }
+
+    /**
+     * Whether the pedal left the shown patch: a patch-change push not loaded yet (PC mode), or without PC mode another
+     * slot answered to `33`. Then the unconfirmed knob values are dropped and, without PC mode, the new slot is
+     * loaded here (in PC mode the push follower loads it).
+     */
+    private suspend fun patchLeft(): Boolean {
+        val slot = if (_state.value.pcMode) null else selectedSlot()
+        val left = pushesArrived != pushesLoaded || (slot != null && slot != _state.value.slot)
+        if (!left) return false
+        sentKnobs = emptyMap()
+        if (slot != null && pushesArrived == pushesLoaded) load(slot)
+        return true
+    }
+
+    private fun fits(p: Patch, slot: Int, index: Int, s: SentKnob): Boolean =
+        slot in p.effects.indices && p.effects[slot].fxId == s.fxId && p.effects[slot].editable(index) &&
+            index < p.effects[slot].params.size
+
+    /**
+     * Confirms the knob values sent ([sentKnobs]) with an edit-buffer read. The real pedal applies fast knob changes
+     * late (vpedal/README.md), so the read may still show an older value: then the last value sent is sent again and
+     * the buffer read again, up to [KNOB_RETRIES] times. A value the pedal still keeps after that is shown, with an
+     * error. Knobs the app did not set take the pedal's values from the last read; a knob whose entry now holds
+     * another effect is dropped, never sent again. Before anything is shown or sent again the session checks that
+     * the pedal is still on the same patch ([patchLeft]); if not, the values are dropped, nothing is sent, and the
+     * new patch is loaded.
+     */
+    private suspend fun settleKnobs() {
+        var attempt = 0
+        while (true) {
+            val read = readEdit()
+            // also the check right before a resend: nothing suspends between it and the sends below
+            if (sentKnobs.isNotEmpty() && patchLeft()) return
+            val off = sentKnobs.filter { (k, s) -> fits(read, k.first, k.second, s) && read.effects[k.first].params[k.second] != s.value }
+            if (off.isEmpty() || attempt >= KNOB_RETRIES) {
+                sentKnobs = emptyMap()
+                setEdit(read)
+                if (off.isNotEmpty()) {
+                    val what = off.entries.joinToString("; ") { (k, s) ->
+                        "knob ${k.second + 1} of effect entry ${k.first} at ${read.effects[k.first].params[k.second]}, not ${s.value}"
+                    }
+                    _state.update { it.copy(error = "the pedal kept $what") }
+                }
+                return
+            }
+            attempt += 1
+            for ((k, s) in off) sendAll(Msg.setParam(Ptcf.position(read, k.first), k.second, s.value))
+            delay(KNOB_RETRY_WAIT_MS)
+        }
+    }
 
     private fun isDirty(p: Patch): Boolean = stored?.let { !Ptcf.samePatch(p.raw, it) } ?: false
 

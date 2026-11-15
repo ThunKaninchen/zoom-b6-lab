@@ -64,7 +64,7 @@ private val GREY = ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation
 
 /** The Guitar Lab picture of an effect, or its name on a coloured box when there is no picture. */
 @Composable
-fun EffectPicture(fx: EffectInfo?, loader: ImageLoader, grey: Boolean, modifier: Modifier = Modifier) {
+fun EffectPicture(fx: EffectInfo?, loader: ImageLoader, grey: Boolean, modifier: Modifier = Modifier, name: String = fx?.name ?: "?") {
     if (fx?.svg != null) {
         AsyncImage(
             model = ImageRequest.Builder(LocalContext.current).data("file:///android_asset/${fx.svg}").build(),
@@ -76,7 +76,7 @@ fun EffectPicture(fx: EffectInfo?, loader: ImageLoader, grey: Boolean, modifier:
         )
     } else {
         Box(modifier.background(B6Colors.Panel), Alignment.Center) {
-            Text(fx?.name ?: "?", style = B6Text.Label, fontSize = 14.sp, textAlign = TextAlign.Center)
+            Text(name, style = B6Text.Label, fontSize = 14.sp, textAlign = TextAlign.Center)
         }
     }
 }
@@ -137,7 +137,7 @@ fun Pedal(
         // the body (select, long press for the chooser, move) fills the pedal; the footswitch band overlays its bottom
         Box(Modifier.fillMaxSize().then(moveDrag).combinedClickable(onClick = onTap, onLongClick = onLongPress)) {
             Box(Modifier.fillMaxSize().alpha(if (view.on) 1f else 0.3f)) {
-                EffectPicture(view.fx, loader, !view.on, Modifier.fillMaxSize().padding(4.dp))
+                EffectPicture(view.fx, loader, !view.on, Modifier.fillMaxSize().padding(4.dp), view.name)
             }
         }
         // footswitch: the 48 dp touch area fades in from transparent so the picture's printed name stays readable

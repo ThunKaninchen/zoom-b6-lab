@@ -24,6 +24,14 @@ class CatalogTest {
         Ptcf.parse(hex(records.first { it["slot"]!!.jsonPrimitive.int == slot }["raw"]!!.jsonPrimitive.content))
 
     @Test
+    fun nameOfBypassUnknownAndKnown() {
+        assertEquals("Bypass", catalog.nameOf(0))
+        assertFalse(catalog.effects.containsKey(0))
+        assertEquals("AMPG SVT", catalog.nameOf(0x05890011))
+        assertEquals("?", catalog.nameOf(0x7F7F7F7F))
+    }
+
+    @Test
     fun loadsSvtAmp() {
         val e = catalog.effects[0x05890011]!!
         assertEquals("AMPG SVT", e.name)
@@ -59,6 +67,27 @@ class CatalogTest {
     }
 
     @Test
+    fun tableKnobsShowThePedalsText() {
+        // AL-149: AMPG SVT MID-F raw 13 shows 220 on the B6 (table in the effect's DSP code)
+        val midF = catalog.effects[0x05890011]!!.params[1]
+        assertEquals("MID-F", midF.name)
+        assertEquals("220", midF.display(13))
+        assertEquals("220", midF.format(13))
+        assertEquals("32", midF.display(0))
+        assertEquals("6.3K", midF.display(31))
+    }
+
+    @Test
+    fun kickFlngKnobsInThePedalsParameterOrder() {
+        // The ZD2's PRME text lists ON/OFF fourth, but it is parameter 6 on the pedal
+        val e = catalog.effects[0x070900E1]!!
+        assertEquals(listOf("PreD", "Depth", "Rate", "RESO", "Mix", "RST-F", "ON/OFF"),
+            e.params.map { it.name })
+        assertEquals("LATCH", e.params[6].display(0))
+        assertEquals("UnLATCH", e.params[6].display(1))
+    }
+
+    @Test
     fun groupsInGuitarLabOrder() {
         val names = catalog.byGroup().map { it.first }
         assertEquals(
@@ -74,6 +103,14 @@ class CatalogTest {
         assertEquals(groups.indexOfFirst { it.first == "IR" }, catalog.groupIndexOf(0x1B000010))
         assertEquals(0, catalog.groupIndexOf(null))
         assertEquals(0, catalog.groupIndexOf(-1))
+    }
+
+    @Test
+    fun clampGroupKeepsTheTabInRange() {
+        val last = catalog.byGroup().size - 1
+        assertEquals(0, catalog.clampGroup(-3))
+        assertEquals(2.coerceAtMost(last), catalog.clampGroup(2))
+        assertEquals(last, catalog.clampGroup(last + 5))
     }
 
     private val ir = 0x1B000010

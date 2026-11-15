@@ -7,11 +7,19 @@ import kotlinx.coroutines.channels.Channel
  * edit semantics follow b6lab/fake.py. Deterministic: replies are queued on [incoming] without delay.
  * Every message received goes through [Safety.check], which throws for anything the app must never send.
  * [busy]: PC mode is held by another program, so `50` is answered `00 11` and the pedal stays out of PC mode.
+ *
+ * [knobLag] (0: off) models the real pedal under fast knob changes (vpedal/README.md: it "applies some knob
+ * changes after the next display request, and its knob echoes skip values while it is busy"): a knob set is
+ * queued and applied only after [knobLag] further messages, or right after the next edit-buffer read has been
+ * answered (the read still shows the old value). While sets are queued the pedal is busy: the echo of a new set
+ * is skipped. Anything else that changes the buffer (chain edits, type changes, store, patch change) applies the
+ * queue first.
  */
 class FakePedal(
     patches: List<ByteArray>,
     private val autoSave: Boolean = false,
     private val busy: Boolean = false,
+    private val knobLag: Int = 0,
 ) : MidiTransport {
     private companion object {
         const val SLOTS = 240
@@ -50,6 +58,11 @@ class FakePedal(
     private val typeMemory = HashMap<Int, List<Int>>()
     private val misrouted = HashMap<Int, Int>()
     private val sentLog = ArrayList<ByteArray>()
+    /** A knob set not applied yet ([knobLag]): effect module, param, value, messages to come before it applies. */
+    private class Late(val module: Int, val param: Int, val value: Int, var due: Int)
+    private val late = ArrayList<Late>()
+    /** (module, knob index) pairs whose sets the pedal ignores: it keeps its value and sends no echo. */
+    private val pinned = HashSet<Pair<Int, Int>>()
     private val channel = Channel<MidiMessage>(Channel.UNLIMITED)
 
     init {
@@ -99,6 +112,14 @@ class FakePedal(
         misrouted[pos] = to
     }
 
+    /** From now on the pedal ignores sets of knob [index] of module [pos]: it keeps its value (no echo). */
+    fun pinKnob(pos: Int, index: Int) {
+        pinned.add(pos to index)
+    }
+
+    /** Knob sets received but not applied yet ([knobLag]). */
+    val lateKnobs: Int get() = late.size
+
     /** The USB cable is pulled: no more messages, sending fails. */
     fun unplug() {
         unplugged = true
@@ -119,6 +140,7 @@ class FakePedal(
     override fun send(bytes: ByteArray) {
         if (unplugged) throw java.io.IOException("pedal unplugged")
         sentLog.add(bytes.copyOf())
+        tick()
         val first = bytes.firstOrNull()?.toInt()?.and(0xFF)
         if (first == 0xF0) {
             check(bytes.size >= 2 && (bytes.last().toInt() and 0xFF) == 0xF7) { "SysEx without F7" }
@@ -128,6 +150,24 @@ class FakePedal(
         } else {
             Safety.check(bytes)
             handleChannel(bytes)
+        }
+    }
+
+    /** One more message arrived: queued knob sets that are due now are applied, oldest first. */
+    private fun tick() {
+        if (late.isEmpty()) return
+        late.forEach { it.due -= 1 }
+        while (late.isNotEmpty() && late[0].due <= 0) applyLate(late.removeAt(0))
+    }
+
+    private fun flushLate() {
+        while (late.isNotEmpty()) applyLate(late.removeAt(0))
+    }
+
+    private fun applyLate(k: Late) {
+        val p = patch()
+        if (k.module < p.effects.size && p.effects[k.module].editable(k.param - 2)) {
+            edit(Ptcf.setParam(p, k.module, k.param - 2, k.value))
         }
     }
 
@@ -149,6 +189,7 @@ class FakePedal(
     }
 
     private fun select(slot: Int) {
+        flushLate() // queued knob changes belong to the patch being left
         selected = slot
         edit = slots[slot].copyOf()
     }
@@ -212,7 +253,10 @@ class FakePedal(
 
     private fun handleFx(m: ByteArray) {
         when (at(m, 4)) {
-            0x13 -> reply(editDump(0x01))
+            0x13 -> {
+                reply(editDump(0x01))
+                flushLate() // the read showed the buffer as it was; the queued knob changes apply now
+            }
             0x0A -> reply(GLOBAL_REPLY.copyOf().also { it[12] = if (autoSave) 1 else 0 })
             0x0D -> if (m.size >= 10) store(at(m, 7) * 4 + at(m, 9))
             0x20 -> if (m.size >= 13 && at(m, 5) == 0x00) live(m)
@@ -222,6 +266,7 @@ class FakePedal(
     /** Patch Save: the edit buffer goes into the slot and the slot is selected; PC mode answers like vpedal. */
     private fun store(slot: Int) {
         if (slot !in 0 until SLOTS) return
+        flushLate()
         slots[slot] = edit.copyOf()
         selected = slot
         if (!inPcMode) return
@@ -236,6 +281,8 @@ class FakePedal(
         val param = at(m, 7)
         val value = Codec.from7(m, 8, 5).toInt()
         val echo = HDR + bytes(0x64, 0x20, 0x01) + m.copyOfRange(6, 13)
+        val knob = module != GLOBAL && module != FOOTSWITCH && param >= 2
+        if (!knob && !(module == GLOBAL && param <= 0x02)) flushLate()
         val p = patch()
         if (module == GLOBAL) {
             when (param) {
@@ -276,6 +323,13 @@ class FakePedal(
                 reply(editDump(0x00))
             }
         } else if (param >= 2 && p.effects[module].editable(param - 2)) {
+            if ((module to param - 2) in pinned) return
+            if (knobLag > 0) {
+                val busyNow = late.isNotEmpty()
+                late.add(Late(module, param, value, knobLag))
+                if (inPcMode && !busyNow) reply(echo)
+                return
+            }
             edit(Ptcf.setParam(p, module, param - 2, value))
             if (inPcMode) reply(echo)
         }

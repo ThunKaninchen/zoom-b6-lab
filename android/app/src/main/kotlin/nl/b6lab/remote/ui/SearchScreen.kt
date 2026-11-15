@@ -167,9 +167,9 @@ private fun ResultRow(hit: SearchHit, tried: Boolean, catalog: Catalog, loader: 
             } else {
                 Text(hit.name, style = B6Text.Title, fontSize = 24.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (hit.fxIds.isNotEmpty()) {
+            if (hit.thumbnailIds.isNotEmpty()) {
                 Row(Modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    hit.fxIds.forEach { id -> EffectPicture(catalog.effects[id], loader, false, Modifier.size(28.dp)) }
+                    hit.thumbnailIds.forEach { id -> EffectPicture(catalog.effects[id], loader, false, Modifier.size(28.dp)) }
                 }
             }
             hit.reason?.let {

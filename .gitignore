@@ -40,3 +40,8 @@ android/dist/
 
 # Patches built by the MCP server (b6lab/mcp_server.py)
 downloads/patches/created/
+
+# Design exchange with Codex: Zoom's effect art, rendered screenshots of it, and the live turn signal
+design/b6-design-system/assets/
+design/b6-design-system/reviews/
+design/b6-design-system/TURN.md

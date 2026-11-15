@@ -17,14 +17,15 @@ import hashlib
 import json
 import threading
 import time
-from contextlib import contextmanager
 from datetime import datetime
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
 from b6lab import ptcf
-from b6lab.device import save_slot, used_bytes, validate_patch
-from b6lab.library import backup_all, list_backups
+from b6lab.core.writes import GuardedWriter
+from b6lab.device import used_bytes, validate_patch
+from b6lab.library import list_backups
 from b6lab.midi import B6, DeviceBusy, NotConnected
 from b6lab import live
 from b6lab.patchspec import (BUDGET, EMPTY_NAME, chain_effect_ids, dsp_load, is_empty_patch,
@@ -110,7 +111,7 @@ class PedalSession:
         self.write_pause = write_pause
         self._lock = threading.Lock()
         self.effect_name = effect_name or _catalog_name  # fx_id -> name, for messages
-        self._full_backup_done = False
+        self._writer = GuardedWriter(self.backup_root, write_pause)
         self._own = {}  # slot (1-240) -> (name, description, empty) written by this session
         self._own_data = {}  # slot (1-240) -> the bytes this session wrote there
         self.audition_path = self.backup_root / "audition.json"
@@ -143,22 +144,10 @@ class PedalSession:
                 dev.close()
 
     def _backup(self, dev) -> str:
-        bs = backup_all(dev, self.backup_root)
+        path = self._writer.full_backup(dev)
         self._own = {}  # the new backup already holds this session's writes
         self._own_data = {}
-        return str(bs.path)
-
-    def _log(self, action, slot, old, new, backup_file, verified, message):
-        old_name, _ = _describe(old)
-        new_name, _ = _describe(new)
-        line = {"time": datetime.now().isoformat(timespec="seconds"), "action": action,
-                "slot": slot, "old_name": old_name, "new_name": new_name,
-                "old_sha256": _sha(old), "new_sha256": _sha(new),
-                "backup_file": str(backup_file) if backup_file else None,
-                "verified": bool(verified), "message": message}
-        self.backup_root.mkdir(parents=True, exist_ok=True)
-        with open(self.log_path, "a") as f:
-            f.write(json.dumps(line) + "\n")
+        return str(path)
 
     def _read_log(self) -> list:
         if not self.log_path.is_file():
@@ -175,19 +164,17 @@ class PedalSession:
         """save_slot with a log line for every attempted write; raises PedalError on failure.
         Called only after the live checks passed, so a refused call does not spend the full
         backup that precedes the session's first write (install or clear)."""
+        had_backup = self._writer.full_backup_path is not None
+        # `live` as expected: the writer cancels ("changed") if the slot differs from what was
+        # checked, e.g. during the full backup.
+        res = self._writer.write(dev, action, slot - 1, data, live, select, log_slot=slot)
         full_backup: Optional[str] = None
-        if not self._full_backup_done:
-            full_backup = self._backup(dev)
-            self._full_backup_done = True
-        # `live` as loaded_data: save_slot re-reads the slot and cancels (confirm_conflict
-        # answers no) if it changed since it was checked, e.g. during the full backup.
-        res = save_slot(dev, slot - 1, data, live, self.overwritten, lambda: False,
-                        select=select)
-        if res.backup_file is not None:  # the pedal was (or may have been) written
-            self._log(action, slot, live, data, res.backup_file, res.ok, res.message)
-            time.sleep(self.write_pause)  # decision 18: pause after every write, failed or not
+        if not had_backup and self._writer.full_backup_path is not None:
+            full_backup = str(self._writer.full_backup_path)
+            self._own = {}  # the new backup already holds this session's writes
+            self._own_data = {}
         if not res.ok:
-            if res.message == "cancelled":
+            if res.message == "changed":
                 raise PedalError(f"slot {slot} changed while {action}ing; nothing written")
             raise PedalError(f"slot {slot}: {res.message}")
         self._own[slot] = (*_describe(data), is_empty_patch(data))
